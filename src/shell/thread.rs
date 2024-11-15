@@ -1,19 +1,11 @@
-use anyhow::Result;
-use nix::{
-    libc::{self, c_int},
-    sys::signal::Signal,
-    unistd::{self, Pid},
-};
-use signal_hook::iterator::Signals;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::mpsc,
-};
+mod worker;
 
-pub enum WorkerMsg {
-    SignalMsg(i32), // Signal input
-    Cmd(String),    // Command input
-}
+use anyhow::Result;
+use nix::{libc::c_int, sys::signal::Signal, unistd::Pid};
+use signal_hook::iterator::Signals;
+use std::sync::mpsc;
+
+pub use worker::{Worker, WorkerMsg};
 
 pub enum ShellMsg {
     Continue(i32), // Continue shell interaction. (i32) is the exit code
@@ -40,50 +32,8 @@ pub enum ProcState {
     Stop,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProcInfo {
     state: ProcState,
     pg_id: Pid,
-}
-
-#[derive(Debug)]
-pub struct Worker {
-    exit_code: i32,                                     // Exit code
-    fg: Option<Pid>,                                    // Foreground process
-    jobs: BTreeMap<usize, (Pid, String)>, // Map of job id to (process group id, command)
-    pg_id_to_pids: HashMap<Pid, (usize, HashSet<Pid>)>, // Map of process group id to (job id, set of process ids)
-    pid_to_info: HashMap<Pid, ProcInfo>,                // Map of process id to process info
-    shell_pg_id: Pid,                                   // Shell process group id
-}
-
-impl Worker {
-    pub fn new() -> Self {
-        Worker {
-            exit_code: 0,
-            fg: None,
-            jobs: BTreeMap::new(),
-            pg_id_to_pids: HashMap::new(),
-            pid_to_info: HashMap::new(),
-            shell_pg_id: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
-        }
-    }
-    pub fn spawn(
-        mut self,
-        worker_rx: mpsc::Receiver<WorkerMsg>,
-        shell_tx: mpsc::SyncSender<ShellMsg>,
-    ) -> Result<()> {
-        std::thread::spawn(move || {
-            for msg in worker_rx.iter() {
-                match msg {
-                    WorkerMsg::Cmd(line) => {
-                        todo!()
-                    }
-                    WorkerMsg::SignalMsg(sig) => {
-                        todo!()
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
 }
