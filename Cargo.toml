@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+dirs = "4.0.0"
+nix = "0.25"
+signal-hook = "0.3.14"
+anyhow = "1.39"
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
