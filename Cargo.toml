@@ -7,7 +7,7 @@ edition = "2021"
 dirs = "4.0.0"
 nix = "0.25"
 signal-hook = "0.3.14"
-anyhow = "1.39"
+anyhow = "1.0"
 
 [profile.release]
 panic = "abort"
