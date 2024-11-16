@@ -16,6 +16,7 @@ use nix::{
 use crate::{
     helper::Defer,
     shell::{
+        parser::{parse_cmd, Cmd},
         syscall,
         thread::{ProcInfo, ProcState},
         ShellMsg,
@@ -141,20 +142,20 @@ impl Worker {
         true
     }
 
-    fn built_in_cmd(&mut self, cmd: &Cmd, shell_tx: &mpsc::SyncSender<ShellMsg>) -> bool {
+    fn built_in_cmd(&mut self, cmd: &[Cmd], shell_tx: &mpsc::SyncSender<ShellMsg>) -> bool {
         if cmd.len() != 1 {
             return false;
         }
-        match cmd[0].0 {
-            "exit" => self.run_exit(&cmd[0].1, shell_tx),
-            "cd" => self.run_cd(&cmd[0].1, shell_tx),
+        match cmd[0].name {
+            "exit" => self.run_exit(&cmd[0].args, shell_tx),
+            "cd" => self.run_cd(&cmd[0].args, shell_tx),
             "jobs" => self.run_jobs(shell_tx),
-            "fg" => self.run_fg(&cmd[0].1, shell_tx),
+            "fg" => self.run_fg(&cmd[0].args, shell_tx),
             _ => false,
         }
     }
 
-    fn spawn_child(&mut self, line: &str, cmd: &Cmd) -> Result<()> {
+    fn spawn_child(&mut self, line: &str, cmd: &[Cmd]) -> Result<()> {
         assert_ne!(cmd.len(), 0);
         let job_id = if let Some(id) = self.get_next_job_id() {
             id
@@ -184,7 +185,7 @@ impl Worker {
             },
         };
 
-        let pg_id = match fork_exec(Pid::from_raw(0), cmd[0].0, &cmd[0].1, None, output) {
+        let pg_id = match fork_exec(Pid::from_raw(0), cmd[0].name, &cmd[0].args, None, output) {
             Ok(child) => child,
             Err(e) => {
                 return Err(e);
@@ -198,7 +199,7 @@ impl Worker {
         let mut pids = HashMap::new();
         pids.insert(pg_id, info.clone());
         if cmd.len() == 2 {
-            match fork_exec(pg_id, cmd[1].0, &cmd[1].1, input, None) {
+            match fork_exec(pg_id, cmd[1].name, &cmd[1].args, input, None) {
                 Ok(child) => {
                     pids.insert(child, info);
                 }
@@ -381,18 +382,4 @@ fn fork_exec(
             }
         }
     }
-}
-
-type Cmd<'a> = Vec<(&'a str, Vec<&'a str>)>;
-
-fn parse_cmd(line: &str) -> Result<Cmd> {
-    let mut cmds = Vec::new();
-    for part in line.split('|') {
-        let mut cmd = part.trim().split_whitespace().collect::<Vec<_>>();
-        if !cmd.is_empty() {
-            let cmd_name = cmd.remove(0);
-            cmds.push((cmd_name, cmd));
-        }
-    }
-    Ok(cmds)
 }
