@@ -6,7 +6,10 @@ use std::{
 use anyhow::Result;
 use nix::{
     libc,
-    sys::signal::{self, Signal},
+    sys::{
+        signal::{self, Signal},
+        wait::{self, wait, WaitPidFlag},
+    },
     unistd::{self, Pid},
 };
 
@@ -206,33 +209,178 @@ impl Worker {
         }
         std::mem::drop(clean_up_pipe);
         self.fg = Some(pg_id);
-        self.insert_job(job_id, pg_id, line.to_string());
+        self.insert_job(job_id, pg_id, pids, line);
         unistd::tcsetpgrp(libc::STDIN_FILENO, pg_id)?;
         Ok(())
     }
 
     fn wait_child(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        todo!()
+        // WUNTRACED: Return if a child has stopped
+        // WNOHANG: Return immediately if no child has exited
+        // WCONTINUED: Return if a stopped child has been continued
+        let flag = Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED);
+
+        loop {
+            match syscall(|| wait::waitpid(Pid::from_raw(-1), flag)) {
+                Ok(wait::WaitStatus::Exited(pid, status)) => {
+                    self.exit_code = status;
+                    self.process_term(pid, shell_tx);
+                }
+                Ok(wait::WaitStatus::Signaled(pid, signal, core)) => {
+                    eprintln!("ZeroSh: Process {} terminated by signal {}", pid, signal);
+                    self.exit_code = 128 + signal as i32;
+                    self.process_term(pid, shell_tx);
+                }
+                Ok(wait::WaitStatus::Stopped(pid, _signal)) => self.process_stop(pid, shell_tx),
+                Ok(wait::WaitStatus::Continued(pid)) => self.process_continue(pid),
+                Ok(wait::WaitStatus::StillAlive) => return,
+                Err(nix::Error::ECHILD) => return,
+                Err(e) => {
+                    eprintln!("ZeroSh: waitpid: {}", e);
+                    std::process::exit(1);
+                }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Ok(wait::WaitStatus::PtraceEvent(pid, _, _)) => self.process_stop(pid, shell_tx),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Ok(wait::WaitStatus::PtraceSyscall(pid)) => self.process_continue(pid),
+            }
+        }
+    }
+
+    fn process_term(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        if let Some((job_id, pg_id)) = self.remove_pid(pid) {
+            self.manage_job(job_id, pg_id, shell_tx);
+        }
+    }
+
+    fn process_stop(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        self.set_pid_state(pid, ProcState::Stop);
+        let pg_id = self.pid_to_info.get(&pid).unwrap().pg_id;
+        let job_id = self.pg_id_to_pids.get(&pg_id).unwrap().0;
+        self.manage_job(job_id, pg_id, shell_tx);
+    }
+
+    fn process_continue(&mut self, pid: Pid) {
+        self.set_pid_state(pid, ProcState::Run);
+    }
+
+    fn set_pid_state(&mut self, pid: Pid, state: ProcState) -> Option<ProcState> {
+        let info = self.pid_to_info.get_mut(&pid)?;
+        let old_state = std::mem::replace(&mut info.state, state);
+        Some(old_state)
+    }
+
+    fn remove_pid(&mut self, pid: Pid) -> Option<(usize, Pid)> {
+        let pg_id = self.pid_to_info.get(&pid)?.pg_id;
+        let it = self.pg_id_to_pids.get_mut(&pg_id)?;
+        it.1.remove(&pid);
+        let job_id = it.0;
+        Some((job_id, pg_id))
     }
 
     fn get_next_job_id(&self) -> Option<usize> {
         (1..).find(|n| !self.jobs.contains_key(&n))
     }
 
-    fn insert_job(&mut self, job_id: usize, pg_id: Pid, cmd: String) {
-        self.jobs.insert(job_id, (pg_id, cmd));
-        self.pg_id_to_pids.insert(pg_id, (job_id, HashSet::new()));
+    fn manage_job(&mut self, job_id: usize, pg_id: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        let is_fg = self.fg.map_or(false, |fg| fg == pg_id);
+        let line = &self.jobs.get(&job_id).unwrap().1;
+        if is_fg {
+            if self.is_group_empty(pg_id) {
+                eprintln!("ZeroSh: [{}] Done {}", job_id, line);
+                self.remove_job(job_id);
+                self.set_shell_fg(shell_tx);
+            } else if self.is_group_stop(pg_id).unwrap() {
+                eprintln!("ZeroSh: [{}] Stopped {}", job_id, line);
+                self.set_shell_fg(shell_tx);
+            }
+        } else if self.is_group_empty(pg_id) {
+            eprintln!("ZeroSh: [{}] Done {}", job_id, line);
+            self.remove_job(job_id);
+        }
+    }
+
+    fn is_group_empty(&self, pg_id: Pid) -> bool {
+        self.pg_id_to_pids.get(&pg_id).unwrap().1.is_empty()
+    }
+
+    fn is_group_stop(&self, pg_id: Pid) -> Option<bool> {
+        Some(
+            self.pg_id_to_pids
+                .get(&pg_id)?
+                .1
+                .iter()
+                .all(|pid| self.pid_to_info.get(pid).unwrap().state != ProcState::Run),
+        )
+    }
+
+    fn insert_job(&mut self, job_id: usize, pg_id: Pid, pids: HashMap<Pid, ProcInfo>, line: &str) {
+        assert!(!self.jobs.contains_key(&job_id));
+        self.jobs.insert(job_id, (pg_id, line.to_string()));
+        let mut procs = HashSet::new();
+        for (pid, info) in pids {
+            procs.insert(pid);
+            assert!(!self.pid_to_info.contains_key(&pid));
+            self.pid_to_info.insert(pid, info);
+        }
+        assert!(!self.pg_id_to_pids.contains_key(&pg_id));
+        self.pg_id_to_pids.insert(pg_id, (job_id, procs));
+    }
+
+    fn remove_job(&mut self, job_id: usize) {
+        if let Some((pg_id, _)) = self.jobs.remove(&job_id) {
+            if let Some((_, pids)) = self.pg_id_to_pids.remove(&pg_id) {
+                assert!(pids.is_empty());
+            }
+        }
+    }
+
+    fn set_shell_fg(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        self.fg = None;
+        unistd::tcsetpgrp(libc::STDIN_FILENO, self.shell_pg_id).unwrap();
+        shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
     }
 }
 
 fn fork_exec(
     pg_id: Pid,
-    cmd: &str,
+    filename: &str,
     args: &[&str],
     input: Option<i32>,
     output: Option<i32>,
 ) -> Result<Pid> {
-    todo!()
+    let filename = std::ffi::CString::new(filename)?;
+    let args = args
+        .iter()
+        .map(|s| std::ffi::CString::new(*s).unwrap())
+        .collect::<Vec<_>>();
+
+    match syscall(|| unsafe { unistd::fork() })? {
+        unistd::ForkResult::Parent { child } => {
+            unistd::setpgid(child, pg_id)?;
+            Ok(child)
+        }
+        unistd::ForkResult::Child => {
+            unistd::setpgid(Pid::from_raw(0), pg_id)?;
+
+            if let Some(stdin_fd) = input {
+                syscall(|| unistd::dup2(stdin_fd, libc::STDIN_FILENO))?;
+            }
+            if let Some(stdout_fd) = output {
+                syscall(|| unistd::dup2(stdout_fd, libc::STDOUT_FILENO))?;
+            }
+            for i in 3..=6 {
+                let _ = syscall(|| unistd::close(i));
+            }
+            match unistd::execvp(&filename, &args) {
+                Err(_) => {
+                    unistd::write(libc::STDERR_FILENO, b"ZeroSh: Unknown command\n")?;
+                    std::process::exit(1);
+                }
+                Ok(_) => unreachable!(),
+            }
+        }
+    }
 }
 
 type Cmd<'a> = Vec<(&'a str, Vec<&'a str>)>;
