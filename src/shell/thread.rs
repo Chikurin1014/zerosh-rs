@@ -1,3 +1,4 @@
+mod process;
 mod worker;
 
 use anyhow::Result;
@@ -24,16 +25,4 @@ pub fn spawn_sig_handler(tx: mpsc::SyncSender<WorkerMsg>) -> Result<()> {
         }
     });
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ProcState {
-    Run,
-    Stop,
-}
-
-#[derive(Debug, Clone)]
-struct ProcInfo {
-    state: ProcState,
-    pg_id: Pid,
 }

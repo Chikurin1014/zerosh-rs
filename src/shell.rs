@@ -1,10 +1,10 @@
+mod parser;
+mod thread;
+
 use anyhow::Result;
 use nix::sys::signal::{signal, SigHandler, Signal};
 use std::sync::mpsc;
 use thread::{spawn_sig_handler, ShellMsg, Worker, WorkerMsg};
-
-mod parser;
-mod thread;
 
 fn syscall<F, T>(f: F) -> Result<T, nix::Error>
 where

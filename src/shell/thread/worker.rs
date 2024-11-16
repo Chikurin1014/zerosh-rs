@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::mpsc,
 };
 
@@ -8,7 +8,7 @@ use nix::{
     libc,
     sys::{
         signal::{self, Signal},
-        wait::{self, wait, WaitPidFlag},
+        wait::{self, WaitPidFlag},
     },
     unistd::{self, Pid},
 };
@@ -18,10 +18,12 @@ use crate::{
     shell::{
         parser::{parse_cmd, Cmd},
         syscall,
-        thread::{ProcInfo, ProcState},
+        thread::process::{Process, ProcessState},
         ShellMsg,
     },
 };
+
+use super::process::{Job, ProcessGroup};
 
 pub enum WorkerMsg {
     SignalMsg(i32), // Signal input
@@ -30,12 +32,12 @@ pub enum WorkerMsg {
 
 #[derive(Debug)]
 pub struct Worker {
-    exit_code: i32,                                     // Exit code
-    fg: Option<Pid>,                                    // Foreground process
-    jobs: BTreeMap<usize, (Pid, String)>, // Map of job id to (process group id, command)
-    pg_id_to_pids: HashMap<Pid, (usize, HashSet<Pid>)>, // Map of process group id to (job id, set of process ids)
-    pid_to_info: HashMap<Pid, ProcInfo>,                // Map of process id to process info
-    shell_pg_id: Pid,                                   // Shell process group id
+    exit_code: i32,                         // Exit code
+    fg: Option<Pid>,                        // Foreground process
+    jobs: BTreeMap<usize, Job>,             // Map of job id to (process group id, command)
+    pgid_to_pg: HashMap<Pid, ProcessGroup>, // Map of process group id to (job id, set of process ids)
+    pid_to_info: HashMap<Pid, Process>,     // Map of process id to process info
+    shell_pgid: Pid,                        // Shell process group id
 }
 
 impl Worker {
@@ -44,9 +46,9 @@ impl Worker {
             exit_code: 0,
             fg: None,
             jobs: BTreeMap::new(),
-            pg_id_to_pids: HashMap::new(),
+            pgid_to_pg: HashMap::new(),
             pid_to_info: HashMap::new(),
-            shell_pg_id: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
+            shell_pgid: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
         }
     }
     pub fn spawn(
@@ -114,8 +116,8 @@ impl Worker {
     }
 
     fn run_jobs(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) -> bool {
-        for (n, (pg_id, cmd)) in &self.jobs {
-            println!("[{}] {} {}", n, pg_id, cmd);
+        for (n, job) in &self.jobs {
+            println!("[{}] {} {}", n, job.pgid, job.command);
         }
         shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
         true
@@ -129,11 +131,11 @@ impl Worker {
             return true;
         }
         if let Ok(n) = arg[1].parse::<usize>() {
-            if let Some((pg_id, cmd)) = self.jobs.get(&n) {
-                eprintln!("ZeroSh: [{}] continued {}", n, cmd);
-                self.fg = Some(*pg_id);
-                unistd::tcsetpgrp(libc::STDIN_FILENO, *pg_id).unwrap();
-                signal::killpg(*pg_id, Signal::SIGCONT).unwrap();
+            if let Some(job) = self.jobs.get(&n) {
+                eprintln!("ZeroSh: [{}] continued {}", n, job.command);
+                self.fg = Some(job.pgid);
+                unistd::tcsetpgrp(libc::STDIN_FILENO, job.pgid).unwrap();
+                signal::killpg(job.pgid, Signal::SIGCONT).unwrap();
                 return true;
             }
         }
@@ -185,23 +187,23 @@ impl Worker {
             },
         };
 
-        let pg_id = match fork_exec(Pid::from_raw(0), cmd[0].name, &cmd[0].args, None, output) {
+        let pgid = match fork_exec(Pid::from_raw(0), cmd[0].name, &cmd[0].args, None, output) {
             Ok(child) => child,
             Err(e) => {
                 return Err(e);
             }
         };
 
-        let info = ProcInfo {
-            state: ProcState::Run,
-            pg_id,
+        let info = Process {
+            pgid,
+            state: ProcessState::Run,
         };
-        let mut pids = HashMap::new();
-        pids.insert(pg_id, info.clone());
+        let mut pgid_to_pid = HashMap::new();
+        pgid_to_pid.insert(pgid, info.clone());
         if cmd.len() == 2 {
-            match fork_exec(pg_id, cmd[1].name, &cmd[1].args, input, None) {
+            match fork_exec(pgid, cmd[1].name, &cmd[1].args, input, None) {
                 Ok(child) => {
-                    pids.insert(child, info);
+                    pgid_to_pid.insert(child, info);
                 }
                 Err(e) => {
                     return Err(e);
@@ -209,9 +211,9 @@ impl Worker {
             }
         }
         std::mem::drop(clean_up_pipe);
-        self.fg = Some(pg_id);
-        self.insert_job(job_id, pg_id, pids, line);
-        unistd::tcsetpgrp(libc::STDIN_FILENO, pg_id)?;
+        self.fg = Some(pgid);
+        self.insert_job(job_id, pgid, pgid_to_pid, line);
+        unistd::tcsetpgrp(libc::STDIN_FILENO, pgid)?;
         Ok(())
     }
 
@@ -249,102 +251,115 @@ impl Worker {
     }
 
     fn process_term(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        if let Some((job_id, pg_id)) = self.remove_pid(pid) {
-            self.manage_job(job_id, pg_id, shell_tx);
+        if let Some((job_id, pgid)) = self.remove_pid(pid) {
+            self.manage_job(job_id, pgid, shell_tx);
         }
     }
 
     fn process_stop(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        self.set_pid_state(pid, ProcState::Stop);
-        let pg_id = self.pid_to_info.get(&pid).unwrap().pg_id;
-        let job_id = self.pg_id_to_pids.get(&pg_id).unwrap().0;
-        self.manage_job(job_id, pg_id, shell_tx);
+        self.set_pid_state(pid, ProcessState::Stop);
+        let pgid = self.pid_to_info.get(&pid).unwrap().pgid;
+        let job_id = self.pgid_to_pg.get(&pgid).unwrap().job_id;
+        self.manage_job(job_id, pgid, shell_tx);
     }
 
     fn process_continue(&mut self, pid: Pid) {
-        self.set_pid_state(pid, ProcState::Run);
+        self.set_pid_state(pid, ProcessState::Run);
     }
 
-    fn set_pid_state(&mut self, pid: Pid, state: ProcState) -> Option<ProcState> {
+    fn set_pid_state(&mut self, pid: Pid, state: ProcessState) -> Option<ProcessState> {
         let info = self.pid_to_info.get_mut(&pid)?;
         let old_state = std::mem::replace(&mut info.state, state);
         Some(old_state)
     }
 
     fn remove_pid(&mut self, pid: Pid) -> Option<(usize, Pid)> {
-        let pg_id = self.pid_to_info.get(&pid)?.pg_id;
-        let it = self.pg_id_to_pids.get_mut(&pg_id)?;
-        it.1.remove(&pid);
-        let job_id = it.0;
-        Some((job_id, pg_id))
+        let pgid = self.pid_to_info.get(&pid)?.pgid;
+        let it = self.pgid_to_pg.get_mut(&pgid)?;
+        it.pids.remove(&pid);
+        Some((it.job_id, pgid))
     }
 
     fn get_next_job_id(&self) -> Option<usize> {
         (1..).find(|n| !self.jobs.contains_key(&n))
     }
 
-    fn manage_job(&mut self, job_id: usize, pg_id: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        let is_fg = self.fg.map_or(false, |fg| fg == pg_id);
-        let line = &self.jobs.get(&job_id).unwrap().1;
+    fn manage_job(&mut self, job_id: usize, pgid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        let is_fg = self.fg.map_or(false, |fg| fg == pgid);
+        let line = &self.jobs.get(&job_id).unwrap().command;
         if is_fg {
-            if self.is_group_empty(pg_id) {
+            if self.is_group_empty(pgid) {
                 eprintln!("ZeroSh: [{}] Done {}", job_id, line);
                 self.remove_job(job_id);
                 self.set_shell_fg(shell_tx);
-            } else if self.is_group_stop(pg_id).unwrap() {
+            } else if self.is_group_stop(pgid).unwrap() {
                 eprintln!("ZeroSh: [{}] Stopped {}", job_id, line);
                 self.set_shell_fg(shell_tx);
             }
-        } else if self.is_group_empty(pg_id) {
+        } else if self.is_group_empty(pgid) {
             eprintln!("ZeroSh: [{}] Done {}", job_id, line);
             self.remove_job(job_id);
         }
     }
 
-    fn is_group_empty(&self, pg_id: Pid) -> bool {
-        self.pg_id_to_pids.get(&pg_id).unwrap().1.is_empty()
+    fn is_group_empty(&self, pgid: Pid) -> bool {
+        self.pgid_to_pg.get(&pgid).unwrap().pids.is_empty()
     }
 
-    fn is_group_stop(&self, pg_id: Pid) -> Option<bool> {
+    fn is_group_stop(&self, pgid: Pid) -> Option<bool> {
         Some(
-            self.pg_id_to_pids
-                .get(&pg_id)?
-                .1
+            self.pgid_to_pg
+                .get(&pgid)?
+                .pids
                 .iter()
-                .all(|pid| self.pid_to_info.get(pid).unwrap().state != ProcState::Run),
+                .all(|pid| self.pid_to_info.get(pid).unwrap().state != ProcessState::Run),
         )
     }
 
-    fn insert_job(&mut self, job_id: usize, pg_id: Pid, pids: HashMap<Pid, ProcInfo>, line: &str) {
+    fn insert_job(
+        &mut self,
+        job_id: usize,
+        pgid: Pid,
+        pgid_to_pid: HashMap<Pid, Process>,
+        line: &str,
+    ) {
         assert!(!self.jobs.contains_key(&job_id));
-        self.jobs.insert(job_id, (pg_id, line.to_string()));
-        let mut procs = HashSet::new();
-        for (pid, info) in pids {
-            procs.insert(pid);
+        self.jobs.insert(
+            job_id,
+            Job {
+                job_id,
+                pgid,
+                command: line.to_string(),
+            },
+        );
+        let mut pids = HashSet::new();
+        for (pid, info) in pgid_to_pid {
+            pids.insert(pid);
             assert!(!self.pid_to_info.contains_key(&pid));
             self.pid_to_info.insert(pid, info);
         }
-        assert!(!self.pg_id_to_pids.contains_key(&pg_id));
-        self.pg_id_to_pids.insert(pg_id, (job_id, procs));
+        assert!(!self.pgid_to_pg.contains_key(&pgid));
+        self.pgid_to_pg
+            .insert(pgid, ProcessGroup { pgid, pids, job_id });
     }
 
     fn remove_job(&mut self, job_id: usize) {
-        if let Some((pg_id, _)) = self.jobs.remove(&job_id) {
-            if let Some((_, pids)) = self.pg_id_to_pids.remove(&pg_id) {
-                assert!(pids.is_empty());
+        if let Some(removed_job) = self.jobs.remove(&job_id) {
+            if let Some(removed_pg) = self.pgid_to_pg.remove(&removed_job.pgid) {
+                assert!(removed_pg.pids.is_empty());
             }
         }
     }
 
     fn set_shell_fg(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) {
         self.fg = None;
-        unistd::tcsetpgrp(libc::STDIN_FILENO, self.shell_pg_id).unwrap();
+        unistd::tcsetpgrp(libc::STDIN_FILENO, self.shell_pgid).unwrap();
         shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
     }
 }
 
 fn fork_exec(
-    pg_id: Pid,
+    pgid: Pid,
     filename: &str,
     args: &[&str],
     input: Option<i32>,
@@ -358,11 +373,11 @@ fn fork_exec(
 
     match syscall(|| unsafe { unistd::fork() })? {
         unistd::ForkResult::Parent { child } => {
-            unistd::setpgid(child, pg_id)?;
+            unistd::setpgid(child, pgid)?;
             Ok(child)
         }
         unistd::ForkResult::Child => {
-            unistd::setpgid(Pid::from_raw(0), pg_id)?;
+            unistd::setpgid(Pid::from_raw(0), pgid)?;
 
             if let Some(stdin_fd) = input {
                 syscall(|| unistd::dup2(stdin_fd, libc::STDIN_FILENO))?;
