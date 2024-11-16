@@ -1,8 +1,9 @@
+mod job;
 mod process;
 mod worker;
 
 use anyhow::Result;
-use nix::{libc::c_int, sys::signal::Signal, unistd::Pid};
+use nix::{libc::c_int, sys::signal::Signal};
 use signal_hook::iterator::Signals;
 use std::sync::mpsc;
 

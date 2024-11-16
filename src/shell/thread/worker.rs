@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::mpsc,
 };
 
@@ -18,12 +18,13 @@ use crate::{
     shell::{
         parser::{parse_cmd, Cmd},
         syscall,
-        thread::process::{Process, ProcessState},
+        thread::{
+            job::{Job, JobId},
+            process::{Process, ProcessGroup, ProcessState},
+        },
         ShellMsg,
     },
 };
-
-use super::process::{Job, ProcessGroup};
 
 pub enum WorkerMsg {
     SignalMsg(i32), // Signal input
@@ -32,22 +33,22 @@ pub enum WorkerMsg {
 
 #[derive(Debug)]
 pub struct Worker {
-    exit_code: i32,                         // Exit code
-    fg: Option<Pid>,                        // Foreground process
-    jobs: BTreeMap<usize, Job>,             // Map of job id to (process group id, command)
-    pgid_to_pg: HashMap<Pid, ProcessGroup>, // Map of process group id to (job id, set of process ids)
-    pid_to_info: HashMap<Pid, Process>,     // Map of process id to process info
-    shell_pgid: Pid,                        // Shell process group id
+    exit_code: i32,                             // Exit code
+    foreground_pid: Option<Pid>,                // Foreground process
+    jobs: BTreeMap<JobId, Job>,                 // Map of job id to (process group id, command)
+    process_groups: HashMap<Pid, ProcessGroup>, // Map of process group id to (job id, set of process ids)
+    processes: HashMap<Pid, Process>,           // Map of process id to process info
+    shell_pgid: Pid,                            // Shell process group id
 }
 
 impl Worker {
     pub fn new() -> Self {
         Worker {
             exit_code: 0,
-            fg: None,
+            foreground_pid: None,
             jobs: BTreeMap::new(),
-            pgid_to_pg: HashMap::new(),
-            pid_to_info: HashMap::new(),
+            process_groups: HashMap::new(),
+            processes: HashMap::new(),
             shell_pgid: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
         }
     }
@@ -73,7 +74,7 @@ impl Worker {
                             shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
                         }
                     },
-                    WorkerMsg::SignalMsg(sig) => {
+                    WorkerMsg::SignalMsg(_sig) => {
                         self.wait_child(&shell_tx);
                     }
                 }
@@ -130,10 +131,10 @@ impl Worker {
             shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
             return true;
         }
-        if let Ok(n) = arg[1].parse::<usize>() {
+        if let Ok(n) = arg[1].parse::<JobId>() {
             if let Some(job) = self.jobs.get(&n) {
                 eprintln!("ZeroSh: [{}] continued {}", n, job.command);
-                self.fg = Some(job.pgid);
+                self.foreground_pid = Some(job.pgid);
                 unistd::tcsetpgrp(libc::STDIN_FILENO, job.pgid).unwrap();
                 signal::killpg(job.pgid, Signal::SIGCONT).unwrap();
                 return true;
@@ -211,7 +212,7 @@ impl Worker {
             }
         }
         std::mem::drop(clean_up_pipe);
-        self.fg = Some(pgid);
+        self.foreground_pid = Some(pgid);
         self.insert_job(job_id, pgid, pgid_to_pid, line);
         unistd::tcsetpgrp(libc::STDIN_FILENO, pgid)?;
         Ok(())
@@ -229,7 +230,7 @@ impl Worker {
                     self.exit_code = status;
                     self.process_term(pid, shell_tx);
                 }
-                Ok(wait::WaitStatus::Signaled(pid, signal, core)) => {
+                Ok(wait::WaitStatus::Signaled(pid, signal, _core)) => {
                     eprintln!("ZeroSh: Process {} terminated by signal {}", pid, signal);
                     self.exit_code = 128 + signal as i32;
                     self.process_term(pid, shell_tx);
@@ -258,8 +259,8 @@ impl Worker {
 
     fn process_stop(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
         self.set_pid_state(pid, ProcessState::Stop);
-        let pgid = self.pid_to_info.get(&pid).unwrap().pgid;
-        let job_id = self.pgid_to_pg.get(&pgid).unwrap().job_id;
+        let pgid = self.processes.get(&pid).unwrap().pgid;
+        let job_id = self.process_groups.get(&pgid).unwrap().job_id;
         self.manage_job(job_id, pgid, shell_tx);
     }
 
@@ -268,24 +269,26 @@ impl Worker {
     }
 
     fn set_pid_state(&mut self, pid: Pid, state: ProcessState) -> Option<ProcessState> {
-        let info = self.pid_to_info.get_mut(&pid)?;
+        let info = self.processes.get_mut(&pid)?;
         let old_state = std::mem::replace(&mut info.state, state);
         Some(old_state)
     }
 
-    fn remove_pid(&mut self, pid: Pid) -> Option<(usize, Pid)> {
-        let pgid = self.pid_to_info.get(&pid)?.pgid;
-        let it = self.pgid_to_pg.get_mut(&pgid)?;
+    fn remove_pid(&mut self, pid: Pid) -> Option<(JobId, Pid)> {
+        let pgid = self.processes.get(&pid)?.pgid;
+        let it = self.process_groups.get_mut(&pgid)?;
         it.pids.remove(&pid);
         Some((it.job_id, pgid))
     }
 
-    fn get_next_job_id(&self) -> Option<usize> {
-        (1..).find(|n| !self.jobs.contains_key(&n))
+    fn get_next_job_id(&self) -> Option<JobId> {
+        (1..)
+            .map(|n| n.into())
+            .find(|n| !self.jobs.contains_key(&n))
     }
 
-    fn manage_job(&mut self, job_id: usize, pgid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        let is_fg = self.fg.map_or(false, |fg| fg == pgid);
+    fn manage_job(&mut self, job_id: JobId, pgid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
+        let is_fg = self.foreground_pid.map_or(false, |fg| fg == pgid);
         let line = &self.jobs.get(&job_id).unwrap().command;
         if is_fg {
             if self.is_group_empty(pgid) {
@@ -303,22 +306,22 @@ impl Worker {
     }
 
     fn is_group_empty(&self, pgid: Pid) -> bool {
-        self.pgid_to_pg.get(&pgid).unwrap().pids.is_empty()
+        self.process_groups.get(&pgid).unwrap().pids.is_empty()
     }
 
     fn is_group_stop(&self, pgid: Pid) -> Option<bool> {
         Some(
-            self.pgid_to_pg
+            self.process_groups
                 .get(&pgid)?
                 .pids
                 .iter()
-                .all(|pid| self.pid_to_info.get(pid).unwrap().state != ProcessState::Run),
+                .all(|pid| self.processes.get(pid).unwrap().state != ProcessState::Run),
         )
     }
 
     fn insert_job(
         &mut self,
-        job_id: usize,
+        job_id: JobId,
         pgid: Pid,
         pgid_to_pid: HashMap<Pid, Process>,
         line: &str,
@@ -327,7 +330,6 @@ impl Worker {
         self.jobs.insert(
             job_id,
             Job {
-                job_id,
                 pgid,
                 command: line.to_string(),
             },
@@ -335,24 +337,24 @@ impl Worker {
         let mut pids = HashSet::new();
         for (pid, info) in pgid_to_pid {
             pids.insert(pid);
-            assert!(!self.pid_to_info.contains_key(&pid));
-            self.pid_to_info.insert(pid, info);
+            assert!(!self.processes.contains_key(&pid));
+            self.processes.insert(pid, info);
         }
-        assert!(!self.pgid_to_pg.contains_key(&pgid));
-        self.pgid_to_pg
-            .insert(pgid, ProcessGroup { pgid, pids, job_id });
+        assert!(!self.process_groups.contains_key(&pgid));
+        self.process_groups
+            .insert(pgid, ProcessGroup { pids, job_id });
     }
 
-    fn remove_job(&mut self, job_id: usize) {
+    fn remove_job(&mut self, job_id: JobId) {
         if let Some(removed_job) = self.jobs.remove(&job_id) {
-            if let Some(removed_pg) = self.pgid_to_pg.remove(&removed_job.pgid) {
+            if let Some(removed_pg) = self.process_groups.remove(&removed_job.pgid) {
                 assert!(removed_pg.pids.is_empty());
             }
         }
     }
 
     fn set_shell_fg(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        self.fg = None;
+        self.foreground_pid = None;
         unistd::tcsetpgrp(libc::STDIN_FILENO, self.shell_pgid).unwrap();
         shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
     }
