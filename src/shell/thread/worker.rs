@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::mpsc,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use nix::{
-    libc,
+    libc::{self},
     sys::{
         signal::{self, Signal},
         wait::{self, WaitPidFlag},
@@ -13,17 +13,14 @@ use nix::{
     unistd::{self, Pid},
 };
 
-use crate::{
-    helper::Defer,
-    shell::{
-        parser::{parse_cmd, Cmd},
-        syscall,
-        thread::{
-            job::{Job, JobId},
-            process::{Process, ProcessGroup, ProcessState},
-        },
-        ShellMsg,
+use crate::shell::{
+    parser::{parse_cmd, Cmd},
+    syscall,
+    thread::{
+        job::{JobId, JobInfo},
+        process::{ProcessGroup, ProcessManager},
     },
+    ShellMsg,
 };
 
 pub enum WorkerMsg {
@@ -33,23 +30,19 @@ pub enum WorkerMsg {
 
 #[derive(Debug)]
 pub struct Worker {
-    exit_code: i32,                             // Exit code
-    foreground_pid: Option<Pid>,                // Foreground process
-    jobs: BTreeMap<JobId, Job>,                 // Map of job id to (process group id, command)
-    process_groups: HashMap<Pid, ProcessGroup>, // Map of process group id to (job id, set of process ids)
-    processes: HashMap<Pid, Process>,           // Map of process id to process info
-    shell_pgid: Pid,                            // Shell process group id
+    exit_code: i32,                  // Exit code
+    process_manager: ProcessManager, // Process manager
+    jobs: HashMap<JobId, JobInfo>,   // Map of job id to job info
+    _shell_pgid: Pid,                // Shell process group id
 }
 
 impl Worker {
     pub fn new() -> Self {
         Worker {
             exit_code: 0,
-            foreground_pid: None,
-            jobs: BTreeMap::new(),
-            process_groups: HashMap::new(),
-            processes: HashMap::new(),
-            shell_pgid: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
+            process_manager: ProcessManager::new(),
+            jobs: HashMap::new(),
+            _shell_pgid: unistd::tcgetpgrp(libc::STDIN_FILENO).unwrap(),
         }
     }
     pub fn spawn(
@@ -134,8 +127,7 @@ impl Worker {
         if let Ok(n) = arg[1].parse::<JobId>() {
             if let Some(job) = self.jobs.get(&n) {
                 eprintln!("ZeroSh: [{}] continued {}", n, job.command);
-                self.foreground_pid = Some(job.pgid);
-                unistd::tcsetpgrp(libc::STDIN_FILENO, job.pgid).unwrap();
+                self.process_manager.set_fg(job.pgid).unwrap();
                 signal::killpg(job.pgid, Signal::SIGCONT).unwrap();
                 return true;
             }
@@ -159,62 +151,52 @@ impl Worker {
     }
 
     fn spawn_child(&mut self, line: &str, cmd: &[Cmd]) -> Result<()> {
-        assert_ne!(cmd.len(), 0);
-        let job_id = if let Some(id) = self.get_next_job_id() {
-            id
-        } else {
-            return Err(anyhow::anyhow!("ZeroSh: Too many jobs"));
-        };
+        assert!(!cmd.is_empty());
+
+        let job_id = self.get_next_job_id().context("Too many jobs")?;
         if cmd.len() > 2 {
-            return Err(anyhow::anyhow!(
-                "ZeroSh: Pipeline doesn't support more than 2 commands"
-            ));
+            Err(anyhow::anyhow!(
+                "Pipe line doesn't support more than 2 commands"
+            ))?;
         }
-        let (input, output) = if cmd.len() == 2 {
-            let p = unistd::pipe()?;
-            (Some(p.0), Some(p.1))
-        } else {
-            (None, None)
-        };
-
-        let clean_up_pipe = Defer {
-            f: || {
-                if let Some(fd) = input {
-                    syscall(|| unistd::close(fd)).unwrap();
-                }
-                if let Some(fd) = output {
-                    syscall(|| unistd::close(fd)).unwrap();
-                }
-            },
-        };
-
-        let pgid = match fork_exec(Pid::from_raw(0), cmd[0].name, &cmd[0].args, None, output) {
-            Ok(child) => child,
-            Err(e) => {
-                return Err(e);
+        // Create a pipe
+        let (input, output) = match cmd.len() {
+            1 => (None, None),
+            2 => {
+                let (i, o) = unistd::pipe()?;
+                (Some(i), Some(o))
             }
+            _ => unreachable!(),
         };
-
-        let info = Process {
-            pgid,
-            state: ProcessState::Run,
+        let pgid = Pid::from_raw(0);
+        let mut pg = ProcessGroup {
+            pids: HashSet::new(),
         };
-        let mut pgid_to_pid = HashMap::new();
-        pgid_to_pid.insert(pgid, info.clone());
+        let pid1 = fork_exec(pgid, cmd[0].name, &cmd[0].args, None, output)?;
+        pg.pids.insert(pid1);
         if cmd.len() == 2 {
-            match fork_exec(pgid, cmd[1].name, &cmd[1].args, input, None) {
-                Ok(child) => {
-                    pgid_to_pid.insert(child, info);
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+            let pid2 = fork_exec(pgid, cmd[1].name, &cmd[1].args, input, None)?;
+            pg.pids.insert(pid2);
         }
-        std::mem::drop(clean_up_pipe);
-        self.foreground_pid = Some(pgid);
-        self.insert_job(job_id, pgid, pgid_to_pid, line);
-        unistd::tcsetpgrp(libc::STDIN_FILENO, pgid)?;
+        self.process_manager.add_group(pgid, pg);
+        self.jobs.insert(
+            job_id,
+            JobInfo {
+                pgid,
+                command: line.to_string(),
+            },
+        );
+
+        // Close pipe
+        if let Some(fd) = input {
+            syscall(|| unistd::close(fd))?;
+        }
+        if let Some(fd) = output {
+            syscall(|| unistd::close(fd))?;
+        }
+
+        // Set the shell process to the foreground
+        self.process_manager.set_fg(pgid)?;
         Ok(())
     }
 
@@ -228,15 +210,17 @@ impl Worker {
             match syscall(|| wait::waitpid(Pid::from_raw(-1), flag)) {
                 Ok(wait::WaitStatus::Exited(pid, status)) => {
                     self.exit_code = status;
-                    self.process_term(pid, shell_tx);
+                    self.process_manager.terminate(pid, shell_tx).unwrap();
                 }
                 Ok(wait::WaitStatus::Signaled(pid, signal, _core)) => {
                     eprintln!("ZeroSh: Process {} terminated by signal {}", pid, signal);
                     self.exit_code = 128 + signal as i32;
-                    self.process_term(pid, shell_tx);
+                    self.process_manager.terminate(pid, shell_tx).unwrap();
                 }
-                Ok(wait::WaitStatus::Stopped(pid, _signal)) => self.process_stop(pid, shell_tx),
-                Ok(wait::WaitStatus::Continued(pid)) => self.process_continue(pid),
+                Ok(wait::WaitStatus::Stopped(pid, _signal)) => {
+                    self.process_manager.stop(pid, shell_tx).unwrap()
+                }
+                Ok(wait::WaitStatus::Continued(pid)) => self.process_manager.resume(pid).unwrap(),
                 Ok(wait::WaitStatus::StillAlive) => return,
                 Err(nix::Error::ECHILD) => return,
                 Err(e) => {
@@ -244,119 +228,21 @@ impl Worker {
                     std::process::exit(1);
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                Ok(wait::WaitStatus::PtraceEvent(pid, _, _)) => self.process_stop(pid, shell_tx),
+                Ok(wait::WaitStatus::PtraceEvent(pid, _, _)) => {
+                    self.process_manager.resume(pid).unwrap()
+                }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                Ok(wait::WaitStatus::PtraceSyscall(pid)) => self.process_continue(pid),
+                Ok(wait::WaitStatus::PtraceSyscall(pid)) => {
+                    self.process_manager.resume(pid).unwrap()
+                }
             }
         }
-    }
-
-    fn process_term(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        if let Some((job_id, pgid)) = self.remove_pid(pid) {
-            self.manage_job(job_id, pgid, shell_tx);
-        }
-    }
-
-    fn process_stop(&mut self, pid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        self.set_pid_state(pid, ProcessState::Stop);
-        let pgid = self.processes.get(&pid).unwrap().pgid;
-        let job_id = self.process_groups.get(&pgid).unwrap().job_id;
-        self.manage_job(job_id, pgid, shell_tx);
-    }
-
-    fn process_continue(&mut self, pid: Pid) {
-        self.set_pid_state(pid, ProcessState::Run);
-    }
-
-    fn set_pid_state(&mut self, pid: Pid, state: ProcessState) -> Option<ProcessState> {
-        let info = self.processes.get_mut(&pid)?;
-        let old_state = std::mem::replace(&mut info.state, state);
-        Some(old_state)
-    }
-
-    fn remove_pid(&mut self, pid: Pid) -> Option<(JobId, Pid)> {
-        let pgid = self.processes.get(&pid)?.pgid;
-        let it = self.process_groups.get_mut(&pgid)?;
-        it.pids.remove(&pid);
-        Some((it.job_id, pgid))
     }
 
     fn get_next_job_id(&self) -> Option<JobId> {
         (1..)
             .map(|n| n.into())
             .find(|n| !self.jobs.contains_key(&n))
-    }
-
-    fn manage_job(&mut self, job_id: JobId, pgid: Pid, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        let is_fg = self.foreground_pid.map_or(false, |fg| fg == pgid);
-        let line = &self.jobs.get(&job_id).unwrap().command;
-        if is_fg {
-            if self.is_group_empty(pgid) {
-                eprintln!("ZeroSh: [{}] Done {}", job_id, line);
-                self.remove_job(job_id);
-                self.set_shell_fg(shell_tx);
-            } else if self.is_group_stop(pgid).unwrap() {
-                eprintln!("ZeroSh: [{}] Stopped {}", job_id, line);
-                self.set_shell_fg(shell_tx);
-            }
-        } else if self.is_group_empty(pgid) {
-            eprintln!("ZeroSh: [{}] Done {}", job_id, line);
-            self.remove_job(job_id);
-        }
-    }
-
-    fn is_group_empty(&self, pgid: Pid) -> bool {
-        self.process_groups.get(&pgid).unwrap().pids.is_empty()
-    }
-
-    fn is_group_stop(&self, pgid: Pid) -> Option<bool> {
-        Some(
-            self.process_groups
-                .get(&pgid)?
-                .pids
-                .iter()
-                .all(|pid| self.processes.get(pid).unwrap().state != ProcessState::Run),
-        )
-    }
-
-    fn insert_job(
-        &mut self,
-        job_id: JobId,
-        pgid: Pid,
-        pgid_to_pid: HashMap<Pid, Process>,
-        line: &str,
-    ) {
-        assert!(!self.jobs.contains_key(&job_id));
-        self.jobs.insert(
-            job_id,
-            Job {
-                pgid,
-                command: line.to_string(),
-            },
-        );
-        let mut pids = HashSet::new();
-        for (pid, info) in pgid_to_pid {
-            pids.insert(pid);
-            assert!(!self.processes.contains_key(&pid));
-            self.processes.insert(pid, info);
-        }
-        assert!(!self.process_groups.contains_key(&pgid));
-        self.process_groups
-            .insert(pgid, ProcessGroup { pids, job_id });
-    }
-
-    fn remove_job(&mut self, job_id: JobId) {
-        if let Some(removed_job) = self.jobs.remove(&job_id) {
-            if let Some(removed_pg) = self.process_groups.remove(&removed_job.pgid) {
-                assert!(removed_pg.pids.is_empty());
-            }
-        }
-    }
-
-    fn set_shell_fg(&mut self, shell_tx: &mpsc::SyncSender<ShellMsg>) {
-        self.foreground_pid = None;
-        unistd::tcsetpgrp(libc::STDIN_FILENO, self.shell_pgid).unwrap();
-        shell_tx.send(ShellMsg::Continue(self.exit_code)).unwrap();
     }
 }
 

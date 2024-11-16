@@ -6,9 +6,9 @@ use std::{
 use nix::unistd;
 
 #[derive(Debug, Clone)]
-pub struct Job {
+pub struct JobInfo {
     pub pgid: unistd::Pid,
-    pub command: String,
+    pub command: String, // Command
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
